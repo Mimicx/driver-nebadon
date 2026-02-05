@@ -1,7 +1,6 @@
 #include "ble_control.h"
 #include <NimBLEDevice.h>
 
-// Detectar si tu NimBLE trae NimBLEConnInfo.h (muchas versiones nuevas sí)
 #if __has_include(<NimBLEConnInfo.h>)
   #include <NimBLEConnInfo.h>
   #define HAS_NIMBLE_CONNINFO 1
@@ -9,7 +8,6 @@
   #define HAS_NIMBLE_CONNINFO 0
 #endif
 
-// Globals
 static NimBLEServer*          g_server = nullptr;
 static NimBLECharacteristic*  g_char   = nullptr;
 
@@ -18,20 +16,17 @@ static bool g_oldConnected = false;
 
 static BleOnWriteFn g_onWrite = nullptr;
 
-// =======================
-// Callbacks
-// =======================
+// para reintentar advertising si algo lo tumba
+static unsigned long g_lastAdvKickMs = 0;
+
 class ServerCallbacks : public NimBLEServerCallbacks {
 public:
 #if HAS_NIMBLE_CONNINFO
-  // Variantes nuevas (con ConnInfo)
   void onConnect(NimBLEServer* s, NimBLEConnInfo& connInfo) override {
     (void)s; (void)connInfo;
     g_connected = true;
     Serial.println("[BLE] Cliente conectado");
   }
-
-  // Algunas versiones traen reason
   void onDisconnect(NimBLEServer* s, NimBLEConnInfo& connInfo, int reason) override {
     (void)s; (void)connInfo; (void)reason;
     g_connected = false;
@@ -39,13 +34,11 @@ public:
     NimBLEDevice::startAdvertising();
   }
 #else
-  // Variantes antiguas (simples)
   void onConnect(NimBLEServer* s) override {
     (void)s;
     g_connected = true;
     Serial.println("[BLE] Cliente conectado");
   }
-
   void onDisconnect(NimBLEServer* s) override {
     (void)s;
     g_connected = false;
@@ -60,17 +53,18 @@ public:
 #if HAS_NIMBLE_CONNINFO
   void onWrite(NimBLECharacteristic* ch, NimBLEConnInfo& connInfo) override {
     (void)connInfo;
-
     std::string v = ch->getValue();
     if (v.empty()) return;
 
     String value(v.c_str());
+    value.trim();
+
     Serial.print("[BLE] RX: ");
     Serial.println(value);
 
     if (g_onWrite) g_onWrite(value);
 
-    if (value == "PING") {
+    if (value.equalsIgnoreCase("PING")) {
       const char* resp = "PONG";
       ch->setValue((uint8_t*)resp, strlen(resp));
       ch->notify();
@@ -83,12 +77,14 @@ public:
     if (v.empty()) return;
 
     String value(v.c_str());
+    value.trim();
+
     Serial.print("[BLE] RX: ");
     Serial.println(value);
 
     if (g_onWrite) g_onWrite(value);
 
-    if (value == "PING") {
+    if (value.equalsIgnoreCase("PING")) {
       const char* resp = "PONG";
       ch->setValue((uint8_t*)resp, strlen(resp));
       ch->notify();
@@ -105,6 +101,8 @@ bool ble_begin(const char* deviceName,
   g_onWrite = onWrite;
 
   NimBLEDevice::init(deviceName);
+  // potencia alta para que sea visible en scan
+  NimBLEDevice::setPower(ESP_PWR_LVL_P9);
 
   g_server = NimBLEDevice::createServer();
   g_server->setCallbacks(new ServerCallbacks());
@@ -117,22 +115,35 @@ bool ble_begin(const char* deviceName,
     NIMBLE_PROPERTY::WRITE |
     NIMBLE_PROPERTY::NOTIFY
   );
-
   g_char->setCallbacks(new CharacteristicCallbacks());
-
   svc->start();
 
+  // -------- Advertising (con NAME + UUID) --------
   NimBLEAdvertising* adv = NimBLEDevice::getAdvertising();
-  adv->addServiceUUID(serviceUUID);
-  // En algunas versiones no existe setScanResponse(true), así que no lo usamos.
+  adv->stop();
+
+  NimBLEAdvertisementData ad;
+  ad.setFlags(0x06); // LE General Discoverable + BR/EDR not supported
+  ad.setName(deviceName);
+  ad.addServiceUUID(NimBLEUUID(serviceUUID));
+  adv->setAdvertisementData(ad);
+
+  NimBLEAdvertisementData sd;
+  sd.setName(deviceName);  // muchos scanners ven el name aquí
+  adv->setScanResponseData(sd);
+
+  adv->setMinInterval(0x20);
+  adv->setMaxInterval(0x40);
+
   adv->start();
 
-  Serial.println("[BLE] Advertising iniciado");
+  Serial.println("[BLE] Advertising iniciado (con Name + ScanResponse)");
+  g_lastAdvKickMs = millis();
   return true;
 }
 
 void ble_loop() {
-  // Heartbeat cada 3s sin delay bloqueante
+  // heartbeat cada 3s
   static uint32_t counter = 0;
   static unsigned long lastHbMs = 0;
 
@@ -152,7 +163,18 @@ void ble_loop() {
     }
   }
 
-  // Mantener lógica old/new
+  // si algo tumbó el advertising (WiFi/TLS), lo “kickeamos” cada 5s si no hay conexión
+  if (!g_connected) {
+    unsigned long now = millis();
+    if (now - g_lastAdvKickMs > 5000) {
+      g_lastAdvKickMs = now;
+      NimBLEDevice::startAdvertising();
+      // no spam: solo cada 5s
+      Serial.println("[BLE] Advertising kick (keep-alive)");
+    }
+  }
+
+  // lógica old/new
   if (!g_connected && g_oldConnected) {
     delay(50);
     NimBLEDevice::startAdvertising();
