@@ -1,9 +1,5 @@
 // net_wifi_mqtt.cpp
-// ✅ Configurado para:
-// 1) Intentar WiFi con credenciales guardadas en NVS (Preferences)
-// 2) Si no hay o falla, queda “listo” para que BLE le mande SSID/PASS
-// 3) Al recibir nuevas credenciales vía net_setWifiCredentials(): guarda (opcional),
-//    reconecta WiFi, corre BOOTSTRAP y levanta MQTT con topics por DEVICE UUID.
+// ✅ NVS WiFi + BLE provisioning + Bootstrap obligatorio + MQTT por device UUID
 
 #include <Arduino.h>
 #include "net_wifi_mqtt.h"
@@ -26,14 +22,10 @@ static NetConfig _cfg{};
 static MqttCmdHandler _onCmd = nullptr;
 static PublishAllFn _publishAllFn = nullptr;
 
-// ✅ Device UUID obtenido del bootstrap (se usa en topics/payload)
 static String _deviceId = "";
+static String topicPub;
+static String topicSub;
 
-// Topics (por device UUID)
-static String topicPub; // nebadondevice/<TENANT>/<DEVICE_UUID>/dt
-static String topicSub; // nebadoncmd/<TENANT>/<DEVICE_UUID>/cmd
-
-// MQTT clients (TCP + TLS)
 static WiFiClient tcpClient;
 static WiFiClientSecure tlsClient;
 
@@ -41,21 +33,18 @@ static PubSubClient mqttTcp(tcpClient);
 static PubSubClient mqttTls(tlsClient);
 static PubSubClient* mqtt = &mqttTcp;
 
-// HTTP clients (evita objetos locales)
 static WiFiClient httpClient;
 static WiFiClientSecure httpsClient;
 
-// Reconnect timers
 static unsigned long lastWifiReconnectAttemptMs = 0;
 static unsigned long lastBootstrapAttemptMs = 0;
 static unsigned long lastMqttReconnectAttemptMs = 0;
 
-// WiFi creds runtime (provienen de NVS o cfg o BLE)
 static String _wifiSsid = "";
 static String _wifiPass = "";
 
 // =======================
-// NVS (Preferences) WiFi storage
+// NVS WiFi
 // =======================
 static Preferences _prefs;
 static const char* PREF_NS = "nebadon";
@@ -79,6 +68,7 @@ static bool nvs_saveWifi(const String &ssid, const String &pass) {
   return true;
 }
 
+// (si luego expones clear al header)
 static void nvs_clearWifi() {
   _prefs.begin(PREF_NS, false);
   _prefs.remove(PREF_SSID);
@@ -123,6 +113,8 @@ static bool setupWiFiWithCreds(const String& ssid, const String& pass, uint32_t 
   Serial.println(ssid);
 
   WiFi.mode(WIFI_STA);
+
+  // Limpieza previa
   WiFi.disconnect(true, true);
   delay(200);
 
@@ -130,7 +122,7 @@ static bool setupWiFiWithCreds(const String& ssid, const String& pass, uint32_t 
 
   unsigned long start = millis();
   while (WiFi.status() != WL_CONNECTED) {
-    delay(300);
+    delay(250);
     Serial.print(".");
     if (millis() - start > timeoutMs) {
       Serial.println("\n❌ WiFi timeout.");
@@ -172,8 +164,7 @@ static void setupTimeIfNeeded() {
 }
 
 // =======================
-// Bootstrap device (HTTP/HTTPS POST)
-// ✅ OBLIGATORIO: si falla -> no hay MQTT
+// Bootstrap
 // =======================
 static bool bootstrapDevice(String &device_uuid_out) {
   device_uuid_out = "";
@@ -182,7 +173,6 @@ static bool bootstrapDevice(String &device_uuid_out) {
     Serial.println("❌ bootstrapDevice: WiFi no conectado");
     return false;
   }
-
   if (!_cfg.api_base || !_cfg.bootstrap_path) {
     Serial.println("❌ bootstrapDevice: api_base/bootstrap_path null");
     return false;
@@ -235,9 +225,6 @@ static bool bootstrapDevice(String &device_uuid_out) {
   String body;
   serializeJson(doc, body);
 
-  Serial.print("BODY: ");
-  Serial.println(body);
-
   int code = http.POST(body);
   String resp = http.getString();
 
@@ -263,7 +250,6 @@ static bool bootstrapDevice(String &device_uuid_out) {
 
   bool ok = rdoc["ok"] | false;
   const char* did = rdoc["device_id"] | "";
-
   if (!ok || !did || strlen(did) == 0) {
     Serial.println("❌ bootstrapDevice: resp no trae ok/device_id válido");
     return false;
@@ -276,7 +262,7 @@ static bool bootstrapDevice(String &device_uuid_out) {
 }
 
 // =======================
-// JSON helpers
+// JSON helpers (MQTT)
 // =======================
 static bool extractVpinAndValue(JsonDocument &doc, String &vpinOut, int &valueOut) {
   const char* vpin = doc["vpin"] | doc["pin"];
@@ -313,24 +299,14 @@ static void onMqttMessage(char* topic, byte* payload, unsigned int length) {
   }
 
   const char* type = doc["type"] | "";
-  if (strlen(type) > 0 && String(type) != "cmd") {
-    Serial.print("⚠️ Ignorado por type=");
-    Serial.println(type);
-    return;
-  }
+  if (strlen(type) > 0 && String(type) != "cmd") return;
 
   const char* t = doc["tenant_id"] | "";
-  if (strlen(t) > 0 && String(t) != String(_cfg.tenant_id)) {
-    Serial.println("⚠️ Ignorado por tenant_id distinto");
-    return;
-  }
+  if (strlen(t) > 0 && String(t) != String(_cfg.tenant_id)) return;
 
   String vpin;
   int valueInt = 0;
-  if (!extractVpinAndValue(doc, vpin, valueInt)) {
-    Serial.println("⚠️ JSON sin vpin/pin o value");
-    return;
-  }
+  if (!extractVpinAndValue(doc, vpin, valueInt)) return;
 
   Serial.print("✅ CMD vpin=");
   Serial.print(vpin);
@@ -341,7 +317,7 @@ static void onMqttMessage(char* topic, byte* payload, unsigned int length) {
 }
 
 // =======================
-// MQTT connect / reconnect (no bloqueante)
+// MQTT connect
 // =======================
 static bool ensureMqttConnected() {
   if (WiFi.status() != WL_CONNECTED) return false;
@@ -354,7 +330,6 @@ static bool ensureMqttConnected() {
   Serial.print(_cfg.mqtt_port);
   Serial.print(" ");
 
-  // ✅ clientId usando UUID del device (más control)
   String clientId = _deviceId + "-" + String((uint32_t)ESP.getEfuseMac(), HEX);
 
   bool ok = mqtt->connect(clientId.c_str(), _cfg.mqtt_user, _cfg.mqtt_pass);
@@ -375,7 +350,7 @@ static bool ensureMqttConnected() {
 }
 
 // =======================
-// Construir MQTT (TCP/TLS) + topics (requiere _deviceId)
+// MQTT config/topics
 // =======================
 static void configureMqttAndTopics() {
   if (_deviceId.length() == 0) return;
@@ -405,7 +380,7 @@ static void configureMqttAndTopics() {
 }
 
 // =======================
-// API pública
+// Public API
 // =======================
 bool net_begin(const NetConfig& cfg, MqttCmdHandler onCmd) {
   _cfg = cfg;
@@ -414,7 +389,7 @@ bool net_begin(const NetConfig& cfg, MqttCmdHandler onCmd) {
   topicPub = "";
   topicSub = "";
 
-  // 1) Cargar WiFi de NVS primero (si existe)
+  // 1) NVS WiFi first
   String savedSsid, savedPass;
   bool hasSaved = nvs_loadWifi(savedSsid, savedPass);
 
@@ -428,17 +403,15 @@ bool net_begin(const NetConfig& cfg, MqttCmdHandler onCmd) {
     Serial.println("ℹ️ WiFi usando credenciales del firmware (no hay NVS).");
   }
 
-  // 2) Intentar WiFi (si hay SSID). Si falla, NO reventamos: dejamos BLE provision.
-  bool wifiOk = setupWiFiWithCreds(_wifiSsid, _wifiPass, 20000);
+  // 2) Try WiFi. If fails -> keep alive for BLE
+  bool wifiOk = setupWiFiWithCreds(_wifiSsid, _wifiPass, 12000);
   if (!wifiOk) {
     Serial.println("⚠️ WiFi no conectado. Esperando provisioning BLE o reconexión en net_loop().");
-    return true; // ✅ importante para que tu main siga y BLE quede activo
+    return true;
   }
 
-  // 3) NTP antes de HTTPS (si aplica)
   setupTimeIfNeeded();
 
-  // 4) BOOTSTRAP obligatorio (si falla, nos quedamos sin MQTT pero seguimos vivos)
   if (!_cfg.api_base || !_cfg.bootstrap_path) {
     Serial.println("❌ api_base/bootstrap_path no definidos. MQTT no iniciará.");
     return true;
@@ -453,7 +426,6 @@ bool net_begin(const NetConfig& cfg, MqttCmdHandler onCmd) {
   _deviceId = deviceUUID;
   configureMqttAndTopics();
 
-  // intento inicial MQTT
   if (!ensureMqttConnected()) {
     Serial.println("⚠️ MQTT no conectó en intento inicial (reintentos en loop).");
   }
@@ -464,16 +436,15 @@ bool net_begin(const NetConfig& cfg, MqttCmdHandler onCmd) {
 void net_loop() {
   unsigned long now = millis();
 
-  // 1) WiFi reconnection (si tenemos SSID)
+  // 1) WiFi reconnect
   if (WiFi.status() != WL_CONNECTED) {
-    if (_wifiSsid.length() == 0) return; // esperando BLE provisioning
+    if (_wifiSsid.length() == 0) return;
 
     if (now - lastWifiReconnectAttemptMs > 3000) {
       lastWifiReconnectAttemptMs = now;
       Serial.println("🔁 Reintentando WiFi...");
       setupWiFiWithCreds(_wifiSsid, _wifiPass, 12000);
 
-      // si reconectó, resetea intentos subsecuentes
       if (WiFi.status() == WL_CONNECTED) {
         setupTimeIfNeeded();
         lastBootstrapAttemptMs = 0;
@@ -483,7 +454,7 @@ void net_loop() {
     return;
   }
 
-  // 2) Si WiFi OK pero no hay bootstrap (deviceId), reintentar bootstrap
+  // 2) Bootstrap retry
   if (_deviceId.length() == 0) {
     if (!_cfg.api_base || !_cfg.bootstrap_path) return;
 
@@ -502,16 +473,17 @@ void net_loop() {
     }
   }
 
-  // 3) MQTT reconnect
+  // 3) MQTT reconnect (con logs)
   if (!mqtt->connected()) {
     if (now - lastMqttReconnectAttemptMs > 2000) {
       lastMqttReconnectAttemptMs = now;
-      ensureMqttConnected();
+      Serial.println("🔁 Reintentando MQTT...");
+      bool ok = ensureMqttConnected();
+      if (ok) Serial.println("✅ MQTT conectado (net_loop)");
     }
     return;
   }
 
-  // 4) Mantener MQTT
   mqtt->loop();
 }
 
@@ -525,7 +497,7 @@ bool net_publishState(const String& vpin, int value) {
   StaticJsonDocument<256> doc;
   doc["type"]      = "state";
   doc["tenant_id"] = _cfg.tenant_id;
-  doc["device_id"] = _deviceId;     // ✅ UUID del device
+  doc["device_id"] = _deviceId;
   doc["vpin"]      = vpin;
   doc["value"]     = value;
 
@@ -545,14 +517,18 @@ void net_setPublishAllFn(PublishAllFn fn) {
 }
 
 // =======================
-// ✅ NUEVO: set WiFi creds desde BLE
+// ✅ WiFi creds desde BLE -> WiFi -> Bootstrap -> MQTT (con logs claros)
 // =======================
 void net_setWifiCredentials(const String& ssid, const String& pass, bool persist) {
   if (ssid.length() == 0) return;
 
-  Serial.println("📥 net_setWifiCredentials(): recibidas credenciales WiFi");
+  Serial.println("========================================");
+  Serial.println("📥 net_setWifiCredentials(): BLE -> WiFi -> Bootstrap -> MQTT");
   Serial.print("SSID=");
   Serial.println(ssid);
+  Serial.print("PASS_LEN=");
+  Serial.println(pass.length());
+  Serial.println("========================================");
 
   _wifiSsid = ssid;
   _wifiPass = pass;
@@ -562,39 +538,56 @@ void net_setWifiCredentials(const String& ssid, const String& pass, bool persist
     Serial.println("💾 WiFi guardado en NVS.");
   }
 
-  // Cortar MQTT actual si existía
-  if (mqtt->connected()) mqtt->disconnect();
-  _deviceId = ""; // obliga a re-bootstrap con nueva red
+  // Reset de la cadena
+  if (mqtt && mqtt->connected()) {
+    Serial.println("🧹 MQTT: desconectando para reprovision...");
+    mqtt->disconnect();
+  }
+
+  _deviceId = "";
   topicPub = "";
   topicSub = "";
 
+  // Forzar WiFi limpio
+  Serial.println("🧹 WiFi: disconnect(true,true) ...");
+  WiFi.disconnect(true, true);
+  delay(200);
+
   // Conectar WiFi
-  bool ok = setupWiFiWithCreds(_wifiSsid, _wifiPass, 20000);
-  if (!ok) {
-    Serial.println("❌ net_setWifiCredentials(): no se logró conectar WiFi.");
+  Serial.println("📶 Intentando conectar WiFi...");
+  bool wifiOk = setupWiFiWithCreds(_wifiSsid, _wifiPass, 12000);
+  if (!wifiOk) {
+    Serial.println("❌ net_setWifiCredentials(): WiFi FAIL");
     return;
   }
+  Serial.println("✅ net_setWifiCredentials(): WiFi OK");
 
   setupTimeIfNeeded();
 
-  // Bootstrap + MQTT
-  if (_cfg.api_base && _cfg.bootstrap_path) {
-    String deviceUUID;
-    if (!bootstrapDevice(deviceUUID)) {
-      Serial.println("❌ net_setWifiCredentials(): bootstrap falló (sin MQTT).");
-      return;
-    }
-
-    _deviceId = deviceUUID;
-    configureMqttAndTopics();
-
-    if (!ensureMqttConnected()) {
-      Serial.println("⚠️ net_setWifiCredentials(): no conectó MQTT (reintentos en loop).");
-    }
-  } else {
+  // Bootstrap
+  if (!(_cfg.api_base && _cfg.bootstrap_path)) {
     Serial.println("❌ net_setWifiCredentials(): api_base/bootstrap_path no definidos.");
+    return;
+  }
+
+  Serial.println("📨 Ejecutando bootstrap...");
+  String deviceUUID;
+  if (!bootstrapDevice(deviceUUID)) {
+    Serial.println("❌ net_setWifiCredentials(): bootstrap FAIL");
+    return;
+  }
+
+  _deviceId = deviceUUID;
+  Serial.print("✅ Bootstrap OK device_id=");
+  Serial.println(_deviceId);
+
+  configureMqttAndTopics();
+
+  // MQTT
+  Serial.println("🔌 Intentando conectar MQTT...");
+  if (!ensureMqttConnected()) {
+    Serial.println("⚠️ net_setWifiCredentials(): MQTT FAIL (se reintenta en net_loop)");
+  } else {
+    Serial.println("✅ net_setWifiCredentials(): MQTT OK");
   }
 }
-
-// (Opcional) si luego quieres exponerlo en header:
-// void net_clearWifiCredentials() { nvs_clearWifi(); _wifiSsid=""; _wifiPass=""; }

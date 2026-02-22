@@ -50,4 +50,5 @@ void net_setPublishAllFn(PublishAllFn fn);
 
 // ✅ NUEVO:
 bool net_isWifiConnected();
+bool net_isConnected();
 void net_setWifiCredentials(const String& ssid, const String& pass, bool persist);
