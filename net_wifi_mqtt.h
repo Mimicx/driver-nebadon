@@ -46,3 +46,8 @@ bool net_publishState(const String& vpin, int value);
 // Publica todos estados que el main le pase (útil al reconectar)
 typedef void (*PublishAllFn)();
 void net_setPublishAllFn(PublishAllFn fn);
+
+
+// ✅ NUEVO:
+bool net_isWifiConnected();
+void net_setWifiCredentials(const String& ssid, const String& pass, bool persist);

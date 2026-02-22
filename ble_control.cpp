@@ -19,6 +19,12 @@ static BleOnWriteFn g_onWrite = nullptr;
 // para reintentar advertising si algo lo tumba
 static unsigned long g_lastAdvKickMs = 0;
 
+static void ble_tx_notify(const char* msg) {
+  if (!g_char) return;
+  g_char->setValue((uint8_t*)msg, strlen(msg));
+  g_char->notify();
+}
+
 class ServerCallbacks : public NimBLEServerCallbacks {
 public:
 #if HAS_NIMBLE_CONNINFO
@@ -26,6 +32,12 @@ public:
     (void)s; (void)connInfo;
     g_connected = true;
     Serial.println("[BLE] Cliente conectado");
+
+    // ✅ Señal a tu app
+    if (g_char) {
+      ble_tx_notify("READY");
+      Serial.println("[BLE] TX notify: READY");
+    }
   }
   void onDisconnect(NimBLEServer* s, NimBLEConnInfo& connInfo, int reason) override {
     (void)s; (void)connInfo; (void)reason;
@@ -38,6 +50,11 @@ public:
     (void)s;
     g_connected = true;
     Serial.println("[BLE] Cliente conectado");
+
+    if (g_char) {
+      ble_tx_notify("READY");
+      Serial.println("[BLE] TX notify: READY");
+    }
   }
   void onDisconnect(NimBLEServer* s) override {
     (void)s;
@@ -62,8 +79,10 @@ public:
     Serial.print("[BLE] RX: ");
     Serial.println(value);
 
+    // 1) Tu callback app-level
     if (g_onWrite) g_onWrite(value);
 
+    // 2) Ping-pong simple
     if (value.equalsIgnoreCase("PING")) {
       const char* resp = "PONG";
       ch->setValue((uint8_t*)resp, strlen(resp));
@@ -101,6 +120,11 @@ bool ble_begin(const char* deviceName,
   g_onWrite = onWrite;
 
   NimBLEDevice::init(deviceName);
+
+  // ✅ MTU más grande para payloads (WiFi provisioning, JSON, etc.)
+  // (No rompe si el peer no lo soporta; se negocia)
+  NimBLEDevice::setMTU(185);
+
   // potencia alta para que sea visible en scan
   NimBLEDevice::setPower(ESP_PWR_LVL_P9);
 
@@ -129,7 +153,7 @@ bool ble_begin(const char* deviceName,
   adv->setAdvertisementData(ad);
 
   NimBLEAdvertisementData sd;
-  sd.setName(deviceName);  // muchos scanners ven el name aquí
+  sd.setName(deviceName);
   adv->setScanResponseData(sd);
 
   adv->setMinInterval(0x20);
@@ -169,7 +193,6 @@ void ble_loop() {
     if (now - g_lastAdvKickMs > 5000) {
       g_lastAdvKickMs = now;
       NimBLEDevice::startAdvertising();
-      // no spam: solo cada 5s
       Serial.println("[BLE] Advertising kick (keep-alive)");
     }
   }
